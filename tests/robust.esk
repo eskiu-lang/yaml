@@ -1,0 +1,87 @@
+// Every prefix of a document and every one-byte change of it parse or fail cleanly (run
+// under --asan in CI on macOS), deep nesting stops at YAML_MAX_DEPTH, and a value can be
+// read back through json_get.
+import <io>;
+import <mem>;
+import <string>;
+import <json>;
+import <yaml>;
+
+string doc = "# service config\n"
+    "---\n"
+    "name: \"pad\"\n"
+    "server:\n"
+    "  host: 0.0.0.0\n"
+    "  port: 8080\n"
+    "  limits: {body: 20971520, timeout_ms: 30000}\n"
+    "models:\n"
+    "  - path: models/detector.onnx\n"
+    "    threshold: 0.6\n"
+    "  - path: 'models/minifasnet.onnx'\n"
+    "    scales: [2.7, 4.0]\n"
+    "log: |\n"
+    "  line one\n"
+    "  line two\n"
+    "notes: >-\n"
+    "  folded\n"
+    "  text\n"
+    "...\n";
+
+int main() {
+    int failures = 0;
+    YamlError err;
+    *JsonValue v = yaml_parse(doc, &err);
+    if (v == null) {
+        printf("FAIL doc: %d:%d: %s\n", err.line, err.col, err.message.cstr());
+        return 1;
+    }
+    *JsonValue port = json_get(v, "server.port");
+    *JsonValue th = json_get(v, "models[0].threshold");
+    *JsonValue sc = json_get(v, "models[1].scales[1]");
+    if (port == null || port.num != 8080.0 || th == null || th.num != 0.6 || sc == null || sc.num != 4.0) {
+        printf("FAIL json_get\n");
+        failures++;
+    }
+    JsonValue_free(v);
+    const int64 n = (int64)strlen(doc);
+    *char buf = alloc<char>(n + 1);
+    int parsed = 0;
+    for (k in 0..n + 1) {
+        *JsonValue p = yaml_parse_bytes((*char)doc, k, &err);
+        if (p != null) {
+            parsed++;
+            JsonValue_free(p);
+        }
+    }
+    const string bytes = " \t\n:-#'\"[]{},|>&*!?%a0";
+    for (k in 0..n) {
+        for (b in 0..(int)strlen(bytes)) {
+            memcpy((*void)buf, (*void)doc, n);
+            buf[k] = bytes[b];
+            *JsonValue p = yaml_parse_bytes(buf, n, &err);
+            JsonValue_free(p);
+        }
+    }
+    free((*void)buf);
+    let deep: String;
+    deep.init(4096);
+    for (i in 0..600) { deep.push('['); }
+    *JsonValue d = yaml_parse(deep.cstr(), &err);
+    if (d != null || strstr(err.message.cstr(), "nested too deeply") == null) {
+        printf("FAIL deep flow nesting\n");
+        failures++;
+    }
+    deep.clear();
+    for (i in 0..600) {
+        for (j in 0..i) { deep.push(' '); }
+        deep.append("- \n");
+    }
+    d = yaml_parse(deep.cstr(), &err);
+    JsonValue_free(d);
+    deep.free();
+    YamlError_free(&err);
+    if (failures == 0) {
+        printf("robust: ok (%d of %lld prefixes parse)\n", parsed, n + 1);
+    }
+    return failures == 0 ? 0 : 1;
+}

@@ -1,0 +1,154 @@
+// yaml_parse against expected JSON (JsonValue_stringify) and expected errors (line:col and
+// message). The expected values follow the YAML 1.2 spec and agree with PyYAML/ruamel for
+// the core schema (checked by hand; tools/check_with_python.py compares them when PyYAML
+// is installed).
+import <io>;
+import <string>;
+import <json>;
+import <yaml>;
+
+int failures = 0;
+
+void ok(string yaml, string want) {
+    YamlError err;
+    *JsonValue v = yaml_parse(yaml, &err);
+    if (v == null) {
+        printf("FAIL %s\n  error %d:%d: %s\n", yaml, err.line, err.col, err.message.cstr());
+        failures++;
+        YamlError_free(&err);
+        return;
+    }
+    let out: String;
+    out.init(64);
+    JsonValue_stringify(v, &out);
+    if (strcmp(out.cstr(), want) != 0) {
+        printf("FAIL %s\n  got  %s\n  want %s\n", yaml, out.cstr(), want);
+        failures++;
+    }
+    out.free();
+    JsonValue_free(v);
+    YamlError_free(&err);
+}
+
+void bad(string yaml, int line, int col, string msg) {
+    YamlError err;
+    *JsonValue v = yaml_parse(yaml, &err);
+    if (v != null) {
+        printf("FAIL %s\n  parsed, want error %d:%d %s\n", yaml, line, col, msg);
+        failures++;
+        JsonValue_free(v);
+        return;
+    }
+    if (err.line != line || err.col != col || strstr(err.message.cstr(), msg) == null) {
+        printf("FAIL %s\n  got  %d:%d: %s\n  want %d:%d: %s\n", yaml, err.line, err.col,
+               err.message.cstr(), line, col, msg);
+        failures++;
+    }
+    YamlError_free(&err);
+}
+
+int main() {
+    // scalars and the core schema
+    ok("", "null");
+    ok("# only a comment\n", "null");
+    ok("hello", "\"hello\"");
+    ok("42", "42");
+    ok("-17", "-17");
+    ok("0x1F", "31");
+    ok("0o17", "15");
+    ok("3.25", "3.25");
+    ok("1e3", "1000");
+    ok(".5", "0.5");
+    ok("true", "true");
+    ok("False", "false");
+    ok("~", "null");
+    ok("Null", "null");
+    ok("yes", "\"yes\"");
+    ok("'42'", "\"42\"");
+    ok("\"true\"", "\"true\"");
+    ok("1_000", "\"1_000\"");
+    ok("0x", "\"0x\"");
+    ok("12abc", "\"12abc\"");
+    ok("[.inf, -.inf, .nan]", "[null,null,null]");
+    // block mappings
+    ok("a: 1\nb: two\nc:\n", "{\"a\":1,\"b\":\"two\",\"c\":null}");
+    ok("server:\n  host: localhost\n  port: 8080\nlog: info\n",
+       "{\"server\":{\"host\":\"localhost\",\"port\":8080},\"log\":\"info\"}");
+    ok("url: http://example.com:80/x\n", "{\"url\":\"http://example.com:80/x\"}");
+    ok("a: b # comment\nc: d#not a comment\n", "{\"a\":\"b\",\"c\":\"d#not a comment\"}");
+    ok("'quoted key': 1\n\"x y\": 2\n", "{\"quoted key\":1,\"x y\":2}");
+    ok("1: one\ntrue: t\n", "{\"1\":\"one\",\"true\":\"t\"}");
+    ok("a:    spaced   \n", "{\"a\":\"spaced\"}");
+    ok("a:\tb\n", "{\"a\":\"b\"}");
+    // block sequences
+    ok("- a\n- b\n- 3\n", "[\"a\",\"b\",3]");
+    ok("items:\n  - one\n  - two\n", "{\"items\":[\"one\",\"two\"]}");
+    ok("items:\n- one\n- two\nnext: 1\n", "{\"items\":[\"one\",\"two\"],\"next\":1}");
+    ok("- name: a\n  val: 1\n- name: b\n  val: 2\n",
+       "[{\"name\":\"a\",\"val\":1},{\"name\":\"b\",\"val\":2}]");
+    ok("- - a\n  - b\n- - c\n", "[[\"a\",\"b\"],[\"c\"]]");
+    ok("-\n  a: 1\n-\n- x\n", "[{\"a\":1},null,\"x\"]");
+    ok("a:\n  - b:\n      - c\n", "{\"a\":[{\"b\":[\"c\"]}]}");
+    // plain multi-line
+    ok("a: one\n  two\n\n  three\nb: x\n", "{\"a\":\"one two\\nthree\",\"b\":\"x\"}");
+    ok("- one\n  two\n", "[\"one two\"]");
+    // quoted
+    ok("a: 'it''s'\n", "{\"a\":\"it's\"}");
+    ok("a: \"tab\\there\\n\\u00e9\\x41\\U0001F600\"\n", "{\"a\":\"tab\\there\\n\xC3\xA9A\xF0\x9F\x98\x80\"}");
+    ok("a: \"one\n  two\n\n  three\"\n", "{\"a\":\"one two\\nthree\"}");
+    ok("a: \"join\\\n   ed\"\n", "{\"a\":\"joined\"}");
+    ok("a: 'x # not a comment'\n", "{\"a\":\"x # not a comment\"}");
+    // block scalars
+    ok("a: |\n  line 1\n  line 2\nb: 1\n", "{\"a\":\"line 1\\nline 2\\n\",\"b\":1}");
+    ok("a: |-\n  x\n\n", "{\"a\":\"x\"}");
+    ok("a: |+\n  x\n\n\nb: 1\n", "{\"a\":\"x\\n\\n\\n\",\"b\":1}");
+    ok("a: >\n  one\n  two\n\n  three\n", "{\"a\":\"one two\\nthree\\n\"}");
+    ok("a: >\n  one\n    more\n  two\n", "{\"a\":\"one\\n  more\\ntwo\\n\"}");
+    ok("a: |2\n    indented\n  x\n", "{\"a\":\"  indented\\nx\\n\"}");
+    ok("a: |\n  keep  \n   inner\n# after\nb: 2\n", "{\"a\":\"keep  \\n inner\\n\",\"b\":2}");
+    ok("- |\n  x\n- y\n", "[\"x\\n\",\"y\"]");
+    ok("a: |\nb: 1\n", "{\"a\":\"\",\"b\":1}");
+    // flow collections
+    ok("[1, two, \"three\", [4], {a: 5}]", "[1,\"two\",\"three\",[4],{\"a\":5}]");
+    ok("a: {x: 1, y: [2, 3], z}\n", "{\"a\":{\"x\":1,\"y\":[2,3],\"z\":null}}");
+    ok("a: [\n  1,\n  2, # two\n  3,\n]\n", "{\"a\":[1,2,3]}");
+    ok("a: {url: http://x.y/z, k: v}\n", "{\"a\":{\"url\":\"http://x.y/z\",\"k\":\"v\"}}");
+    ok("[]", "[]");
+    ok("{}", "{}");
+    // documents
+    ok("---\na: 1\n", "{\"a\":1}");
+    ok("--- 5\n", "5");
+    ok("a: 1\n...\n", "{\"a\":1}");
+    ok("--- |\n  text\n", "\"text\\n\"");
+    ok("a: 1\r\nb: 2\r\n", "{\"a\":1,\"b\":2}");
+    ok("\xEF\xBB\xBFa: 1\n", "{\"a\":1}");
+    ok("a:\n  # comment\n  b: 1\n", "{\"a\":{\"b\":1}}");
+    // errors
+    bad("a: 1\na: 2\n", 2, 1, "duplicate key");
+    bad("{a: 1, a: 2}", 1, 8, "duplicate key");
+    bad("a: b: c\n", 1, 4, "mapping values are not allowed here");
+    bad("a: - b\n", 1, 4, "a block sequence cannot start");
+    bad("a:\n  b: 1\n   c: 2\n", 3, 5, "mapping values are not allowed here");
+    bad("a:\n    b: 1\n  c: 2\n", 3, 3, "bad indentation");
+    ok("- a\n  - b\n", "[\"a - b\"]");
+    bad("a: &x 1\n", 1, 4, "anchors and aliases");
+    bad("a: *x\n", 1, 4, "anchors and aliases");
+    bad("a: !tag 1\n", 1, 4, "tags are not supported");
+    bad("%YAML 1.2\n---\na: 1\n", 1, 1, "directives");
+    bad("? a\n: b\n", 1, 1, "complex keys");
+    bad("a: 1\n---\nb: 2\n", 2, 1, "several documents");
+    bad("a:\n\tb: 1\n", 2, 2, "tab character");
+    bad("a: \"open\n", 1, 4, "not closed");
+    bad("a: [1, 2\n", 1, 4, "not closed");
+    ok("a: [1 2]\n", "{\"a\":[\"1 2\"]}");
+    bad("a: [1, {b: 2]\n", 1, 13, "expected ',' or '}'");
+    bad("a: [x: 1]\n", 1, 6, "flow sequence");
+    bad("a: \"\\q\"\n", 1, 5, "unknown escape");
+    bad("a: \"x\" y\n", 1, 8, "unexpected text after the value");
+    bad("a: 1\n- b\n", 2, 1, "found a sequence entry");
+    bad("  a: 1\nb: 2\n", 2, 1, "unexpected content");
+    if (failures == 0) {
+        printf("yaml: ok\n");
+    }
+    return failures == 0 ? 0 : 1;
+}
