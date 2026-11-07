@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: |
+          curl -fsSL https://eskiu-lang.org/install.sh | ESKIU_PREFIX=$HOME/.eskiu sh
+          echo "$HOME/.eskiu/bin" >> $GITHUB_PATH
+      - name: Tests
+        run: eskiuc test
+      - name: API reference is current
+        run: python3 -I tools/gen_api.py --check
+      - name: Example
+        run: eskiuc run examples/config.esk -- examples/service.yaml 'server.port'
+      - name: Expected values agree with ruamel.yaml
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q ruamel.yaml
+          /tmp/venv/bin/python -I tools/check_with_python.py
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu
+        run: brew install eskiu-lang/eskiu/eskiu llvm@22
+      - name: Tests
+        run: eskiuc test
+      - name: Address sanitizer
+        run: |
+          # Apple's clang has an older ASan runtime than LLVM 22's instrumentation.
+          export CC=$(brew --prefix llvm@22)/bin/clang
+          mkdir -p build
+          eskiuc --asan tests/robust.esk -o build/robust_asan
+          build/robust_asan
+          eskiuc --asan tests/yaml.esk -o build/yaml_asan
+          build/yaml_asan
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc unzip
+      - name: Install Eskiu
+        run: |
+          curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
+          unzip -q eskiu.zip -d $HOME/eskiu
+      - name: Tests
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          CC=gcc eskiuc test
