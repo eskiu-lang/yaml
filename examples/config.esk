@@ -1,0 +1,32 @@
+// Prints a YAML file as JSON, or one value of it: `eskiuc run -- config.yaml [path]`,
+// where path is a json_get path such as server.port or models[0].path.
+import <io>;
+import <string>;
+import <json>;
+import <yaml>;
+
+int main(int argc, string* argv) {
+    if (argc < 2) {
+        println_err("usage: config FILE.yaml [PATH]");
+        return 2;
+    }
+    YamlError err;
+    *JsonValue cfg = yaml_load(argv[1], &err);
+    if (cfg == null) {
+        printf("%s:%d:%d: %s\n", argv[1], err.line, err.col, err.message.cstr());
+        YamlError_free(&err);
+        return 1;
+    }
+    defer JsonValue_free(cfg);
+    *JsonValue v = argc > 2 ? json_get(cfg, argv[2]) : cfg;
+    if (v == null) {
+        printf("%s: no value at %s\n", argv[1], argv[2]);
+        return 1;
+    }
+    let out: String;
+    out.init(256);
+    JsonValue_pretty(v, 2, &out);
+    printf("%s\n", out.cstr());
+    out.free();
+    return 0;
+}

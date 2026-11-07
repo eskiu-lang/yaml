@@ -1,0 +1,14 @@
+# A service configuration.
+name: pad
+server:
+  host: 0.0.0.0
+  port: 8080
+  limits: {body: 20971520, timeout_ms: 30000}
+models:
+  - path: models/detector.onnx
+    threshold: 0.6
+  - path: models/minifasnet.onnx
+    scales: [2.7, 4.0]
+banner: |
+  Ready.
+  Listening.
