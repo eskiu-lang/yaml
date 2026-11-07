@@ -66,16 +66,13 @@ $ eskiuc run examples/config.esk -- examples/service.yaml 'models[1].scales'
 ]
 ```
 
-`yaml_parse` reads a string and `yaml_parse_bytes` a buffer. Every function and type is in
-the [API reference](docs/api.md).
+`yaml_parse` reads a string and `yaml_parse_bytes` a buffer.
 
-## What is left out
+## Documentation
 
-Anchors and aliases (`&a`, `*a`), tags (`!x`), complex keys (`? `), directives
-(`%YAML`), several documents in one stream and a `key: value` pair inside a flow sequence
-are each reported as an error at their position. Tabs may separate tokens but not indent.
-Numbers are doubles, as in `<json>`, so an integer past 2^53 loses precision, and keys are
-always strings (`1: a` has the key `"1"`).
+- [What is left out](docs/README.md#what-is-left-out)
+- [Contributing](docs/README.md#contributing)
+- [API reference](docs/api.md): every public function and type
 
 ## Install
 
@@ -84,13 +81,6 @@ eskiuc add yaml --git https://github.com/eskiu-lang/yaml --rev v0.1.0
 ```
 
 It needs Eskiu 0.14 or newer and runs everywhere Eskiu does.
-
-## Contributing
-
-Bug reports are welcome; please include the YAML and the `eskiuc --version` output. The
-tests run with `eskiuc test`. `python3 -I tools/check_with_python.py` (with
-`pip install ruamel.yaml`) compares the tests' expected values with ruamel.yaml, and
-`python3 -I tools/gen_api.py` regenerates `docs/api.md` from the source comments.
 
 ## License
 
