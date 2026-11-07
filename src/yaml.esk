@@ -1,0 +1,1194 @@
+// yaml.esk: reads YAML configuration files into the standard library's JSON tree.
+//
+//     YamlError err;
+//     *JsonValue cfg = yaml_load("config.yaml", &err);
+//     if (cfg == null) {
+//         printf("config.yaml:%d:%d: %s\n", err.line, err.col, err.message.cstr());
+//         return 1;
+//     }
+//     defer JsonValue_free(cfg);
+//     *JsonValue port = json_get(cfg, "server.port");
+//
+// The result is a <json> JsonValue, so json_get paths, JsonValue_get/at and
+// JsonValue_stringify work on it. One document is read, with the YAML 1.2 core schema:
+// block mappings and sequences (also a sequence at the same indentation as its key),
+// flow collections ([a, b], {a: 1}), plain, single-quoted and double-quoted scalars
+// (folded over several lines, every escape), literal and folded block scalars (|, >, with
+// chomping and indentation indicators), comments, and the --- and ... markers. A plain
+// scalar is null (null, Null, NULL, ~ or nothing), a boolean (true, True, TRUE, false,
+// ...), an integer (decimal, 0x hex, 0o octal), a float (1.5, 1e3, .inf, -.inf, .nan), or
+// else a string; a quoted or block scalar is always a string. Numbers are doubles, as in
+// <json>, so an integer past 2^53 loses precision. Keys are strings: `1: a` has the key
+// "1". A duplicate key is an error.
+//
+// Left out, each a located error: anchors and aliases (&a, *a), tags (!x), complex keys
+// (? ), directives (%YAML), several documents in one stream, and a key: value pair inside
+// a flow sequence. Tabs may separate tokens but not indent.
+
+import <mem>;
+import <string>;
+import <json>;
+import <fs>;
+
+// The deepest nesting of collections the parser accepts; deeper input is an error.
+const int YAML_MAX_DEPTH = 512;
+
+// Where and why a parse failed: line and col count from 1 (col in bytes), message says
+// what was wrong. Free it with YamlError_free.
+struct YamlError {
+    int line;
+    int col;
+    String message;
+}
+
+// Frees the message.
+void YamlError_free(YamlError* self) {
+    if (self.message.data != null) {
+        self.message.free();
+    }
+}
+
+struct _Yp {
+    *char s;
+    int64 n;
+    int64 i;
+    int depth;
+    bool failed;
+    int64 err_at;
+    String err;
+}
+
+char _yp_ch(_Yp* p, int64 k) {
+    return k < p.n ? p.s[k] : (char)0;
+}
+
+bool _yp_eol(char c) {
+    return c == 0 || c == '\n';
+}
+
+bool _yp_ws(char c) {
+    return c == ' ' || c == '\t';
+}
+
+bool _yp_blank(char c) {
+    return c == 0 || c == '\n' || c == ' ' || c == '\t';
+}
+
+void _yp_fail(_Yp* p, int64 at, string msg) {
+    if (!p.failed) {
+        p.failed = true;
+        p.err_at = at;
+        p.err.clear();
+        p.err.append(msg);
+    }
+}
+
+int64 _yp_col(_Yp* p, int64 at) {
+    int64 k = at;
+    while (k > 0 && p.s[k - 1] != '\n') {
+        k--;
+    }
+    return at - k;
+}
+
+// A --- or ... marker at the start of the line at k.
+bool _yp_marker(_Yp* p, int64 k) {
+    if (_yp_col(p, k) != 0) {
+        return false;
+    }
+    const char c = _yp_ch(p, k);
+    if (c != '-' && c != '.') {
+        return false;
+    }
+    return _yp_ch(p, k + 1) == c && _yp_ch(p, k + 2) == c && _yp_blank(_yp_ch(p, k + 3));
+}
+
+void _yp_skip_comment(_Yp* p) {
+    while (!_yp_eol(_yp_ch(p, p.i))) {
+        p.i++;
+    }
+}
+
+// Moves to the next content: past spaces, comments and line breaks. A tab before content
+// at the start of a line is an error (tabs do not indent).
+void _yp_skip(_Yp* p) {
+    bool line_start = p.i == 0 || p.s[p.i - 1] == '\n';
+    bool tab = false;
+    while (p.i < p.n && !p.failed) {
+        const char c = p.s[p.i];
+        if (c == ' ') {
+            p.i++;
+        } else if (c == '\t') {
+            if (line_start) {
+                tab = true;
+            }
+            p.i++;
+        } else if (c == '\n') {
+            p.i++;
+            line_start = true;
+            tab = false;
+        } else if (c == '#') {
+            _yp_skip_comment(p);
+        } else {
+            if (line_start && tab) {
+                _yp_fail(p, p.i, "a tab character indents this line (indent with spaces)");
+            }
+            return;
+        }
+    }
+}
+
+// After a value on its line: only spaces and a comment may follow.
+void _yp_end_line(_Yp* p) {
+    const int64 start = p.i;
+    while (_yp_ws(_yp_ch(p, p.i))) {
+        p.i++;
+    }
+    const char c = _yp_ch(p, p.i);
+    if (c == '#' && (p.i > start || p.i == 0 || _yp_ws(p.s[p.i - 1]))) {
+        _yp_skip_comment(p);
+        return;
+    }
+    if (!_yp_eol(c)) {
+        _yp_fail(p, p.i, "unexpected text after the value");
+    }
+}
+
+*JsonValue _yp_string(*char data, int64 len) {
+    *JsonValue v = JsonValue_new(JString);
+    v.str.init(len + 1);
+    v.str.append_bytes(data, len);
+    return v;
+}
+
+bool _yp_text_is(String* t, string a, string b, string c) {
+    string s = t.cstr();
+    return strcmp(s, a) == 0 || strcmp(s, b) == 0 || strcmp(s, c) == 0;
+}
+
+int _yp_digit(char c, int base) {
+    int d = -1;
+    if (c >= '0' && c <= '9') {
+        d = (int)(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+        d = (int)(c - 'a') + 10;
+    } else if (c >= 'A' && c <= 'F') {
+        d = (int)(c - 'A') + 10;
+    }
+    return d < base ? d : -1;
+}
+
+// The core-schema integer in t (decimal, 0x, 0o), or false.
+bool _yp_int(String* t, *double out) {
+    *char s = t.data;
+    int64 n = t.len;
+    int64 k = 0;
+    double sign = 1.0;
+    int base = 10;
+    if (n > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'o')) {
+        base = s[1] == 'x' ? 16 : 8;
+        k = 2;
+    } else if (n > 0 && (s[0] == '-' || s[0] == '+')) {
+        sign = s[0] == '-' ? -1.0 : 1.0;
+        k = 1;
+    }
+    if (k >= n) {
+        return false;
+    }
+    double v = 0.0;
+    while (k < n) {
+        const int d = _yp_digit(s[k], base);
+        if (d < 0) {
+            return false;
+        }
+        v = v * (double)base + (double)d;
+        k++;
+    }
+    *out = sign * v;
+    return true;
+}
+
+// The core-schema float in t, or false.
+bool _yp_float(String* t, *double out) {
+    *char s = t.data;
+    int64 n = t.len;
+    int64 k = 0;
+    double sign = 1.0;
+    if (n > 0 && (s[0] == '-' || s[0] == '+')) {
+        sign = s[0] == '-' ? -1.0 : 1.0;
+        k = 1;
+    }
+    string rest = (string)(s + k);
+    if (strcmp(rest, ".inf") == 0 || strcmp(rest, ".Inf") == 0 || strcmp(rest, ".INF") == 0) {
+        *out = sign / 0.0;
+        return true;
+    }
+    if (k == 0 && (strcmp(rest, ".nan") == 0 || strcmp(rest, ".NaN") == 0 || strcmp(rest, ".NAN") == 0)) {
+        *out = 0.0 / 0.0;
+        return true;
+    }
+    int digits = 0;
+    while (k < n && s[k] >= '0' && s[k] <= '9') {
+        k++;
+        digits++;
+    }
+    if (k < n && s[k] == '.') {
+        k++;
+        while (k < n && s[k] >= '0' && s[k] <= '9') {
+            k++;
+            digits++;
+        }
+    }
+    if (digits == 0) {
+        return false;
+    }
+    if (k < n && (s[k] == 'e' || s[k] == 'E')) {
+        k++;
+        if (k < n && (s[k] == '-' || s[k] == '+')) {
+            k++;
+        }
+        int ed = 0;
+        while (k < n && s[k] >= '0' && s[k] <= '9') {
+            k++;
+            ed++;
+        }
+        if (ed == 0) {
+            return false;
+        }
+    }
+    if (k != n) {
+        return false;
+    }
+    return String_parse_double(t, out) == 1;
+}
+
+// The value of a plain scalar under the core schema.
+*JsonValue _yp_resolve(String* t) {
+    if (t.len == 0 || _yp_text_is(t, "null", "Null", "NULL") || _yp_text_is(t, "~", "~", "~")) {
+        return JsonValue_null();
+    }
+    if (_yp_text_is(t, "true", "True", "TRUE")) {
+        return JsonValue_bool(1);
+    }
+    if (_yp_text_is(t, "false", "False", "FALSE")) {
+        return JsonValue_bool(0);
+    }
+    double d = 0.0;
+    if (_yp_int(t, &d) || _yp_float(t, &d)) {
+        return JsonValue_number(d);
+    }
+    return _yp_string(t.data, t.len);
+}
+
+void _yp_trim_right(String* t) {
+    while (t.len > 0 && _yp_ws(t.data[t.len - 1])) {
+        t.len--;
+    }
+    if (t.data != null) {
+        t.data[t.len] = 0;
+    }
+}
+
+// Appends the UTF-8 encoding of code point cp.
+void _yp_utf8(String* out, uint32 cp) {
+    if (cp < 0x80) {
+        out.push((char)cp);
+    } else if (cp < 0x800) {
+        out.push((char)(0xC0 | (cp >> 6)));
+        out.push((char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push((char)(0xE0 | (cp >> 12)));
+        out.push((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push((char)(0x80 | (cp & 0x3F)));
+    } else {
+        out.push((char)(0xF0 | (cp >> 18)));
+        out.push((char)(0x80 | ((cp >> 12) & 0x3F)));
+        out.push((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push((char)(0x80 | (cp & 0x3F)));
+    }
+}
+
+// A line break inside a quoted scalar: trailing blanks are dropped, one break becomes a
+// space and each further empty line a newline; leading blanks of the next line go.
+void _yp_fold_break(_Yp* p, String* out) {
+    _yp_trim_right(out);
+    p.i++;
+    int breaks = 0;
+    while (true) {
+        while (_yp_ws(_yp_ch(p, p.i))) {
+            p.i++;
+        }
+        if (_yp_ch(p, p.i) == '\n') {
+            breaks++;
+            p.i++;
+        } else {
+            break;
+        }
+    }
+    if (breaks == 0) {
+        out.push(' ');
+    }
+    for (b in 0..breaks) {
+        out.push('\n');
+    }
+}
+
+// A single- or double-quoted scalar at p.i, into out.
+void _yp_quoted(_Yp* p, String* out) {
+    const int64 start = p.i;
+    const char q = p.s[p.i];
+    p.i++;
+    while (!p.failed) {
+        const char c = _yp_ch(p, p.i);
+        if (c == 0 && p.i >= p.n) {
+            _yp_fail(p, start, "this quoted scalar is not closed");
+            return;
+        }
+        if (c == q) {
+            if (q == '\'' && _yp_ch(p, p.i + 1) == '\'') {
+                out.push('\'');
+                p.i += 2;
+                continue;
+            }
+            p.i++;
+            return;
+        }
+        if (c == '\n') {
+            _yp_fold_break(p, out);
+            continue;
+        }
+        if (q == '"' && c == '\\') {
+            const char e = _yp_ch(p, p.i + 1);
+            p.i += 2;
+            if (e == '\n') {
+                while (_yp_ws(_yp_ch(p, p.i))) {
+                    p.i++;
+                }
+                continue;
+            }
+            int hex = 0;
+            if (e == 'n') { out.push('\n'); }
+            else if (e == 't' || e == '\t') { out.push('\t'); }
+            else if (e == 'r') { out.push('\r'); }
+            else if (e == '0') { out.push((char)0); }
+            else if (e == 'a') { out.push((char)7); }
+            else if (e == 'b') { out.push((char)8); }
+            else if (e == 'e') { out.push((char)27); }
+            else if (e == 'f') { out.push((char)12); }
+            else if (e == 'v') { out.push((char)11); }
+            else if (e == ' ') { out.push(' '); }
+            else if (e == '"') { out.push('"'); }
+            else if (e == '/') { out.push('/'); }
+            else if (e == '\\') { out.push('\\'); }
+            else if (e == 'N') { _yp_utf8(out, 0x85); }
+            else if (e == '_') { _yp_utf8(out, 0xA0); }
+            else if (e == 'L') { _yp_utf8(out, 0x2028); }
+            else if (e == 'P') { _yp_utf8(out, 0x2029); }
+            else if (e == 'x') { hex = 2; }
+            else if (e == 'u') { hex = 4; }
+            else if (e == 'U') { hex = 8; }
+            else {
+                _yp_fail(p, p.i - 2, "unknown escape in a double-quoted scalar");
+                return;
+            }
+            if (hex > 0) {
+                uint32 cp = 0;
+                for (h in 0..hex) {
+                    const int d = _yp_digit(_yp_ch(p, p.i), 16);
+                    if (d < 0) {
+                        _yp_fail(p, p.i, "bad hexadecimal escape");
+                        return;
+                    }
+                    cp = cp * 16 + (uint32)d;
+                    p.i++;
+                }
+                if (cp > 0x10FFFF) {
+                    _yp_fail(p, p.i - (int64)hex, "escape past U+10FFFF");
+                    return;
+                }
+                _yp_utf8(out, cp);
+            }
+            continue;
+        }
+        out.push(c);
+        p.i++;
+    }
+}
+
+// Whether the text at p.i is a block mapping key: a scalar on this line followed by ':'
+// and a blank.
+bool _yp_is_key(_Yp* p) {
+    int64 k = p.i;
+    const char c = _yp_ch(p, k);
+    if (c == '"' || c == '\'') {
+        k++;
+        while (k < p.n && p.s[k] != '\n') {
+            if (p.s[k] == '\\' && c == '"') {
+                k += 2;
+                continue;
+            }
+            if (p.s[k] == c) {
+                if (c == '\'' && _yp_ch(p, k + 1) == '\'') {
+                    k += 2;
+                    continue;
+                }
+                break;
+            }
+            k++;
+        }
+        if (_yp_ch(p, k) != c) {
+            return false;
+        }
+        k++;
+        while (_yp_ws(_yp_ch(p, k))) {
+            k++;
+        }
+        return _yp_ch(p, k) == ':' && _yp_blank(_yp_ch(p, k + 1));
+    }
+    if (c == '[' || c == '{') {
+        return false;
+    }
+    while (!_yp_eol(_yp_ch(p, k))) {
+        const char d = p.s[k];
+        if (d == ':' && _yp_blank(_yp_ch(p, k + 1))) {
+            return true;
+        }
+        if (d == '#' && k > p.i && _yp_ws(p.s[k - 1])) {
+            return false;
+        }
+        k++;
+    }
+    return false;
+}
+
+bool _yp_indicator_error(_Yp* p) {
+    const char c = _yp_ch(p, p.i);
+    if (c == '&' || c == '*') {
+        _yp_fail(p, p.i, "anchors and aliases are not supported");
+    } else if (c == '!') {
+        _yp_fail(p, p.i, "tags are not supported");
+    } else if (c == '%') {
+        _yp_fail(p, p.i, "directives are not supported");
+    } else if (c == '?' && _yp_blank(_yp_ch(p, p.i + 1))) {
+        _yp_fail(p, p.i, "complex keys (?) are not supported");
+    } else if (c == '@' || c == '`') {
+        _yp_fail(p, p.i, "'@' and '`' cannot start a plain scalar");
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// One line of a plain scalar from p.i in block context: up to a comment or the end of the
+// line. A ": " inside is an error.
+void _yp_plain_line(_Yp* p, String* out) {
+    while (!_yp_eol(_yp_ch(p, p.i))) {
+        const char c = p.s[p.i];
+        if (c == '#' && p.i > 0 && _yp_ws(p.s[p.i - 1])) {
+            break;
+        }
+        if (c == ':' && _yp_blank(_yp_ch(p, p.i + 1))) {
+            _yp_fail(p, p.i, "mapping values are not allowed here");
+            return;
+        }
+        out.push(c);
+        p.i++;
+    }
+    _yp_trim_right(out);
+}
+
+// A plain scalar in block context; its continuation lines are indented more than parent.
+*JsonValue _yp_plain(_Yp* p, int64 parent) {
+    let t: String;
+    t.init(32);
+    _yp_plain_line(p, &t);
+    while (!p.failed) {
+        // look ahead over empty lines to the next line's content
+        int64 k = p.i;
+        if (_yp_ch(p, k) == '#') {
+            break;
+        }
+        while (_yp_ws(_yp_ch(p, k))) {
+            k++;
+        }
+        if (_yp_ch(p, k) == '#') {
+            break;
+        }
+        if (_yp_ch(p, k) != '\n') {
+            break;
+        }
+        int breaks = 0;
+        int64 line = k + 1;
+        int64 c = line;
+        bool found = false;
+        while (line < p.n) {
+            c = line;
+            while (_yp_ch(p, c) == ' ') {
+                c++;
+            }
+            while (_yp_ws(_yp_ch(p, c))) {
+                c++;
+            }
+            if (_yp_ch(p, c) == '\n') {
+                breaks++;
+                line = c + 1;
+                continue;
+            }
+            found = c < p.n;
+            break;
+        }
+        if (!found) {
+            break;
+        }
+        int64 ind = 0;
+        while (p.s[line + ind] == ' ') {
+            ind++;
+        }
+        if (ind <= parent || p.s[c] == '#' || _yp_marker(p, line)) {
+            break;
+        }
+        if (breaks == 0) {
+            t.push(' ');
+        }
+        for (b in 0..breaks) {
+            t.push('\n');
+        }
+        p.i = c;
+        _yp_plain_line(p, &t);
+    }
+    *JsonValue v = _yp_resolve(&t);
+    t.free();
+    return v;
+}
+
+// A literal (|) or folded (>) block scalar at p.i, whose parent node is indented `parent`.
+*JsonValue _yp_block_scalar(_Yp* p, int64 parent) {
+    const char style = p.s[p.i];
+    p.i++;
+    int chomp = 0;
+    int64 explicit_ind = 0;
+    for (r in 0..2) {
+        const char c = _yp_ch(p, p.i);
+        if ((c == '-' || c == '+') && chomp == 0) {
+            chomp = c == '-' ? -1 : 1;
+            p.i++;
+        } else if (c >= '1' && c <= '9' && explicit_ind == 0) {
+            explicit_ind = (int64)(c - '0');
+            p.i++;
+        }
+    }
+    if (!_yp_blank(_yp_ch(p, p.i))) {
+        _yp_fail(p, p.i, "unexpected text after the block scalar indicator");
+        return null;
+    }
+    _yp_end_line(p);
+    if (p.failed) {
+        return null;
+    }
+    if (p.i < p.n) {
+        p.i++;
+    }
+    const int64 base = parent < 0 ? 0 : parent + 1;
+    int64 ind = 0;
+    if (explicit_ind > 0) {
+        ind = (parent < 0 ? 0 : parent) + explicit_ind;
+    } else {
+        int64 k = p.i;
+        ind = -1;
+        while (k < p.n) {
+            int64 sp = 0;
+            while (_yp_ch(p, k + sp) == ' ') {
+                sp++;
+            }
+            if (_yp_ch(p, k + sp) == '\n') {
+                k = k + sp + 1;
+                continue;
+            }
+            if (k + sp < p.n) {
+                ind = sp;
+            }
+            break;
+        }
+        if (ind < base) {
+            ind = -1;
+        }
+    }
+    let out: String;
+    out.init(64);
+    int pending = 0;
+    bool first = true;
+    bool prev_more = false;
+    while (p.i < p.n && ind >= 0) {
+        int64 sp = 0;
+        while (_yp_ch(p, p.i + sp) == ' ') {
+            sp++;
+        }
+        int64 e = p.i + sp;
+        while (_yp_ws(_yp_ch(p, e))) {
+            e++;
+        }
+        const bool empty = _yp_eol(_yp_ch(p, e));
+        if (!empty && sp < ind) {
+            if (_yp_ch(p, p.i + sp) == '\t' && sp < ind) {
+                _yp_fail(p, p.i + sp, "a tab character indents this line (indent with spaces)");
+            }
+            break;
+        }
+        if (_yp_marker(p, p.i)) {
+            break;
+        }
+        int64 le = p.i;
+        while (!_yp_eol(_yp_ch(p, le))) {
+            le++;
+        }
+        if (empty) {
+            pending++;
+        } else {
+            *char text = p.s + p.i + ind;
+            const int64 len = le - (p.i + ind);
+            const bool more = text[0] == ' ' || text[0] == '\t';
+            if (first) {
+                for (b in 0..pending) {
+                    out.push('\n');
+                }
+            } else if (style == '>' && !more && !prev_more) {
+                if (pending == 0) {
+                    out.push(' ');
+                }
+                for (b in 0..pending) {
+                    out.push('\n');
+                }
+            } else {
+                for (b in 0..pending + 1) {
+                    out.push('\n');
+                }
+            }
+            out.append_bytes(text, len);
+            first = false;
+            prev_more = more;
+            pending = 0;
+        }
+        p.i = le < p.n ? le + 1 : le;
+    }
+    if (!first) {
+        if (chomp == 0) {
+            out.push('\n');
+        } else if (chomp == 1) {
+            for (b in 0..pending + 1) {
+                out.push('\n');
+            }
+        }
+    } else if (chomp == 1) {
+        for (b in 0..pending) {
+            out.push('\n');
+        }
+    }
+    *JsonValue v = _yp_string(out.data, out.len);
+    out.free();
+    return v;
+}
+
+*JsonValue _yp_flow(_Yp* p);
+
+// Spaces, line breaks and comments inside a flow collection.
+void _yp_flow_skip(_Yp* p) {
+    while (p.i < p.n) {
+        const char c = p.s[p.i];
+        if (c == ' ' || c == '\t' || c == '\n') {
+            p.i++;
+        } else if (c == '#' && (p.i == 0 || _yp_blank(p.s[p.i - 1]))) {
+            _yp_skip_comment(p);
+        } else {
+            return;
+        }
+    }
+}
+
+bool _yp_flow_stop(_Yp* p, int64 k) {
+    const char c = _yp_ch(p, k);
+    if (c == ',' || c == '[' || c == ']' || c == '{' || c == '}') {
+        return true;
+    }
+    if (c == ':') {
+        const char d = _yp_ch(p, k + 1);
+        return _yp_blank(d) || d == ',' || d == ']' || d == '}';
+    }
+    if (c == '#' && k > 0 && _yp_blank(p.s[k - 1])) {
+        return true;
+    }
+    return c == 0 && k >= p.n;
+}
+
+// A plain scalar in a flow collection, folded over line breaks.
+void _yp_flow_plain(_Yp* p, String* t) {
+    while (!p.failed) {
+        while (!_yp_flow_stop(p, p.i) && !_yp_eol(_yp_ch(p, p.i))) {
+            t.push(p.s[p.i]);
+            p.i++;
+        }
+        _yp_trim_right(t);
+        if (_yp_ch(p, p.i) != '\n') {
+            return;
+        }
+        int64 k = p.i;
+        int breaks = 0;
+        while (_yp_ch(p, k) == '\n') {
+            k++;
+            while (_yp_ws(_yp_ch(p, k))) {
+                k++;
+            }
+            if (_yp_ch(p, k) == '\n') {
+                breaks++;
+            }
+        }
+        if (_yp_flow_stop(p, k) || (k >= p.n)) {
+            return;
+        }
+        if (breaks == 0) {
+            t.push(' ');
+        }
+        for (b in 0..breaks) {
+            t.push('\n');
+        }
+        p.i = k;
+    }
+}
+
+*JsonValue _yp_flow_scalar(_Yp* p) {
+    let t: String;
+    t.init(16);
+    *JsonValue v = null;
+    const char c = _yp_ch(p, p.i);
+    if (c == '"' || c == '\'') {
+        _yp_quoted(p, &t);
+        v = _yp_string(t.data, t.len);
+    } else {
+        if (_yp_indicator_error(p)) {
+            t.free();
+            return null;
+        }
+        if (_yp_flow_stop(p, p.i)) {
+            _yp_fail(p, p.i, "expected a value");
+            t.free();
+            return null;
+        }
+        _yp_flow_plain(p, &t);
+        v = _yp_resolve(&t);
+    }
+    t.free();
+    return v;
+}
+
+*JsonValue _yp_flow(_Yp* p) {
+    _yp_flow_skip(p);
+    const char c = _yp_ch(p, p.i);
+    if (c != '[' && c != '{') {
+        return _yp_flow_scalar(p);
+    }
+    if (++p.depth > YAML_MAX_DEPTH) {
+        _yp_fail(p, p.i, "nested too deeply");
+        return null;
+    }
+    const int64 open = p.i;
+    p.i++;
+    *JsonValue v = c == '[' ? JsonValue_array() : JsonValue_object();
+    const char close = c == '[' ? ']' : '}';
+    while (!p.failed) {
+        _yp_flow_skip(p);
+        if (_yp_ch(p, p.i) == close) {
+            p.i++;
+            p.depth--;
+            return v;
+        }
+        if (p.i >= p.n) {
+            _yp_fail(p, open, "this flow collection is not closed");
+            break;
+        }
+        if (c == '[') {
+            *JsonValue item = _yp_flow(p);
+            if (p.failed) {
+                JsonValue_free(item);
+                break;
+            }
+            _yp_flow_skip(p);
+            if (_yp_ch(p, p.i) == ':') {
+                JsonValue_free(item);
+                _yp_fail(p, p.i, "a key: value pair inside a flow sequence is not supported");
+                break;
+            }
+            JsonValue_push(v, item);
+        } else {
+            let key: String;
+            key.init(16);
+            const int64 kat = p.i;
+            const char kc = _yp_ch(p, p.i);
+            if (kc == '"' || kc == '\'') {
+                _yp_quoted(p, &key);
+            } else if (kc == '[' || kc == '{') {
+                _yp_fail(p, p.i, "complex keys are not supported");
+            } else if (!_yp_indicator_error(p)) {
+                _yp_flow_plain(p, &key);
+            }
+            if (p.failed) {
+                key.free();
+                break;
+            }
+            _yp_flow_skip(p);
+            *JsonValue val = null;
+            if (_yp_ch(p, p.i) == ':') {
+                p.i++;
+                _yp_flow_skip(p);
+                const char d = _yp_ch(p, p.i);
+                if (d == ',' || d == '}') {
+                    val = JsonValue_null();
+                } else {
+                    val = _yp_flow(p);
+                }
+            } else {
+                val = JsonValue_null();
+            }
+            if (p.failed) {
+                JsonValue_free(val);
+                key.free();
+                break;
+            }
+            if (JsonValue_get(v, key.cstr()) != null) {
+                _yp_fail(p, kat, "duplicate key");
+                JsonValue_free(val);
+                key.free();
+                break;
+            }
+            JsonValue_set(v, key.cstr(), val);
+            key.free();
+        }
+        _yp_flow_skip(p);
+        if (p.i >= p.n) {
+            _yp_fail(p, open, "this flow collection is not closed");
+            break;
+        }
+        const char sep = _yp_ch(p, p.i);
+        if (sep == ',') {
+            p.i++;
+        } else if (sep != close) {
+            _yp_fail(p, p.i, c == '[' ? "expected ',' or ']'" : "expected ',' or '}'");
+        }
+    }
+    JsonValue_free(v);
+    return null;
+}
+
+*JsonValue _yp_node(_Yp* p, int64 parent, bool block_ok);
+
+// A block sequence whose dashes are in column `col`.
+*JsonValue _yp_seq(_Yp* p, int64 col) {
+    *JsonValue arr = JsonValue_array();
+    while (!p.failed) {
+        p.i++;
+        while (_yp_ws(_yp_ch(p, p.i))) {
+            p.i++;
+        }
+        const char c = _yp_ch(p, p.i);
+        *JsonValue item = null;
+        if (_yp_eol(c) || c == '#') {
+            _yp_skip(p);
+            if (p.i < p.n && !p.failed && _yp_col(p, p.i) > col && !_yp_marker(p, p.i)) {
+                item = _yp_node(p, col, true);
+            } else {
+                item = JsonValue_null();
+            }
+        } else {
+            item = _yp_node(p, col, true);
+        }
+        if (p.failed) {
+            JsonValue_free(item);
+            break;
+        }
+        JsonValue_push(arr, item);
+        _yp_skip(p);
+        if (p.failed || p.i >= p.n || _yp_marker(p, p.i)) {
+            break;
+        }
+        const int64 c2 = _yp_col(p, p.i);
+        if (c2 < col) {
+            break;
+        }
+        if (c2 > col) {
+            _yp_fail(p, p.i, "bad indentation of a sequence entry");
+            break;
+        }
+        if (!(_yp_ch(p, p.i) == '-' && _yp_blank(_yp_ch(p, p.i + 1)))) {
+            break;
+        }
+    }
+    if (p.failed) {
+        JsonValue_free(arr);
+        return null;
+    }
+    return arr;
+}
+
+// A block mapping whose keys are in column `col`.
+*JsonValue _yp_map(_Yp* p, int64 col) {
+    *JsonValue map = JsonValue_object();
+    while (!p.failed) {
+        const int64 kat = p.i;
+        if (_yp_indicator_error(p)) {
+            break;
+        }
+        let key: String;
+        key.init(16);
+        const char kc = _yp_ch(p, p.i);
+        if (kc == '"' || kc == '\'') {
+            _yp_quoted(p, &key);
+            while (_yp_ws(_yp_ch(p, p.i))) {
+                p.i++;
+            }
+        } else {
+            while (!(_yp_ch(p, p.i) == ':' && _yp_blank(_yp_ch(p, p.i + 1))) && !_yp_eol(_yp_ch(p, p.i))) {
+                key.push(p.s[p.i]);
+                p.i++;
+            }
+            _yp_trim_right(&key);
+        }
+        if (!p.failed && _yp_ch(p, p.i) != ':') {
+            _yp_fail(p, p.i, "expected ':' after a mapping key");
+        }
+        if (p.failed) {
+            key.free();
+            break;
+        }
+        p.i++;
+        if (JsonValue_get(map, key.cstr()) != null) {
+            _yp_fail(p, kat, "duplicate key");
+            key.free();
+            break;
+        }
+        while (_yp_ws(_yp_ch(p, p.i))) {
+            p.i++;
+        }
+        const char c = _yp_ch(p, p.i);
+        *JsonValue val = null;
+        if (_yp_eol(c) || c == '#') {
+            _yp_skip(p);
+            if (p.i >= p.n || p.failed || _yp_marker(p, p.i)) {
+                val = JsonValue_null();
+            } else {
+                const int64 c2 = _yp_col(p, p.i);
+                if (c2 > col) {
+                    val = _yp_node(p, col, true);
+                } else if (c2 == col && _yp_ch(p, p.i) == '-' && _yp_blank(_yp_ch(p, p.i + 1))) {
+                    val = _yp_seq(p, col);
+                } else {
+                    val = JsonValue_null();
+                }
+            }
+        } else {
+            val = _yp_node(p, col, false);
+        }
+        if (p.failed) {
+            JsonValue_free(val);
+            key.free();
+            break;
+        }
+        JsonValue_set(map, key.cstr(), val);
+        key.free();
+        _yp_skip(p);
+        if (p.failed || p.i >= p.n || _yp_marker(p, p.i)) {
+            break;
+        }
+        const int64 c3 = _yp_col(p, p.i);
+        if (c3 < col) {
+            break;
+        }
+        if (c3 > col) {
+            _yp_fail(p, p.i, "bad indentation of a mapping entry");
+            break;
+        }
+        if (_yp_ch(p, p.i) == '-' && _yp_blank(_yp_ch(p, p.i + 1))) {
+            _yp_fail(p, p.i, "expected a mapping key, found a sequence entry");
+            break;
+        }
+    }
+    if (p.failed) {
+        JsonValue_free(map);
+        return null;
+    }
+    return map;
+}
+
+// The node at p.i, whose parent is indented `parent`. block_ok is false for a value on
+// its key's line, where a block collection cannot start.
+*JsonValue _yp_node(_Yp* p, int64 parent, bool block_ok) {
+    if (++p.depth > YAML_MAX_DEPTH) {
+        _yp_fail(p, p.i, "nested too deeply");
+        return null;
+    }
+    const int64 col = _yp_col(p, p.i);
+    const char c = _yp_ch(p, p.i);
+    *JsonValue v = null;
+    if (c == '-' && _yp_blank(_yp_ch(p, p.i + 1))) {
+        if (!block_ok) {
+            _yp_fail(p, p.i, "a block sequence cannot start on its key's line");
+        } else {
+            v = _yp_seq(p, col);
+        }
+    } else if (c == '|' || c == '>') {
+        v = _yp_block_scalar(p, parent);
+    } else if (_yp_indicator_error(p)) {
+        v = null;
+    } else if (_yp_is_key(p)) {
+        if (!block_ok) {
+            _yp_fail(p, p.i, "mapping values are not allowed here");
+        } else {
+            v = _yp_map(p, col);
+        }
+    } else if (c == '[' || c == '{') {
+        v = _yp_flow(p);
+        if (!p.failed) {
+            _yp_end_line(p);
+        }
+    } else if (c == '"' || c == '\'') {
+        let t: String;
+        t.init(16);
+        _yp_quoted(p, &t);
+        if (!p.failed) {
+            _yp_end_line(p);
+            v = _yp_string(t.data, t.len);
+        }
+        t.free();
+    } else {
+        v = _yp_plain(p, parent);
+    }
+    p.depth--;
+    if (p.failed) {
+        JsonValue_free(v);
+        return null;
+    }
+    return v;
+}
+
+void _yp_set_error(_Yp* p, YamlError* err) {
+    if (err == null) {
+        return;
+    }
+    int line = 1;
+    int64 ls = 0;
+    for (k in 0..p.err_at) {
+        if (p.s[k] == '\n') {
+            line++;
+            ls = k + 1;
+        }
+    }
+    err.line = line;
+    err.col = (int)(p.err_at - ls) + 1;
+    if (err.message.data == null) {
+        err.message.init(64);
+    }
+    err.message.clear();
+    err.message.append(p.err.cstr());
+}
+
+// Parses the YAML document in the len bytes at text. Returns the value (free it with
+// JsonValue_free), or null on an error, which is described in *err (err may be null). An
+// empty document is a JSON null. CRLF line ends and a UTF-8 byte order mark are accepted.
+*JsonValue yaml_parse_bytes(*char text, int64 len, YamlError* err) {
+    let p: _Yp;
+    p.s = alloc<char>(len + 1);
+    p.n = 0;
+    int64 k = 0;
+    if (len >= 3 && (uint8)text[0] == 0xEF && (uint8)text[1] == 0xBB && (uint8)text[2] == 0xBF) {
+        k = 3;
+    }
+    while (k < len) {
+        if (text[k] == '\r' && k + 1 < len && text[k + 1] == '\n') {
+            k++;
+            continue;
+        }
+        p.s[p.n] = text[k];
+        p.n++;
+        k++;
+    }
+    p.s[p.n] = 0;
+    p.err.init(64);
+    *JsonValue root = null;
+    _yp_skip(&p);
+    if (!p.failed && p.i < p.n && p.s[p.i] == '%' && _yp_col(&p, p.i) == 0) {
+        _yp_fail(&p, p.i, "directives are not supported");
+    }
+    bool started = false;
+    if (!p.failed && _yp_marker(&p, p.i) && p.s[p.i] == '-') {
+        p.i += 3;
+        started = true;
+        while (_yp_ws(_yp_ch(&p, p.i))) {
+            p.i++;
+        }
+        if (_yp_ch(&p, p.i) == '#' || _yp_eol(_yp_ch(&p, p.i))) {
+            _yp_skip(&p);
+        }
+    }
+    if (!p.failed) {
+        if (p.i >= p.n || (_yp_marker(&p, p.i) && p.s[p.i] == '.')) {
+            root = JsonValue_null();
+        } else if (_yp_marker(&p, p.i)) {
+            root = JsonValue_null();
+        } else {
+            root = _yp_node(&p, -1, true);
+        }
+    }
+    if (!p.failed) {
+        _yp_skip(&p);
+        if (p.i < p.n && _yp_marker(&p, p.i) && p.s[p.i] == '.') {
+            p.i += 3;
+            _yp_end_line(&p);
+            _yp_skip(&p);
+        }
+        if (!p.failed && p.i < p.n) {
+            if (_yp_marker(&p, p.i) && p.s[p.i] == '-') {
+                _yp_fail(&p, p.i, "several documents in one stream are not supported");
+            } else {
+                _yp_fail(&p, p.i, "unexpected content (check the indentation)");
+            }
+        }
+    }
+    if (p.failed) {
+        JsonValue_free(root);
+        root = null;
+        _yp_set_error(&p, err);
+    } else if (err != null) {
+        err.line = 0;
+        err.col = 0;
+        if (err.message.data != null) {
+            err.message.clear();
+        }
+    }
+    free((*void)p.s);
+    p.err.free();
+    return root;
+}
+
+// Parses a NUL-terminated YAML document; see yaml_parse_bytes.
+*JsonValue yaml_parse(string text, YamlError* err) {
+    return yaml_parse_bytes((*char)text, (int64)strlen(text), err);
+}
+
+// Reads and parses the YAML file at path; see yaml_parse_bytes. A file that cannot be read
+// is an error at line 0.
+*JsonValue yaml_load(string path, YamlError* err) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) {
+        if (err != null) {
+            err.line = 0;
+            err.col = 0;
+            if (err.message.data == null) {
+                err.message.init(64);
+            }
+            err.message.clear();
+            err.message.append("cannot read the file");
+        }
+        return null;
+    }
+    *JsonValue v = yaml_parse_bytes((*char)d, n, err);
+    free((*void)d);
+    return v;
+}
