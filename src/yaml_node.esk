@@ -1,0 +1,267 @@
+// yaml_node.esk: maps, sequences and the entry points (part of yaml.esk, which imports it in order after the ones before it)
+
+// A block mapping whose keys are in column `col`.
+*JsonValue _yp_map(_Yp* p, int64 col) {
+    *JsonValue map = JsonValue_object();
+    while (!p.failed) {
+        const int64 kat = p.i;
+        if (_yp_indicator_error(p)) {
+            break;
+        }
+        let key: String;
+        key.init(16);
+        const char kc = _yp_ch(p, p.i);
+        if (kc == '"' || kc == '\'') {
+            _yp_quoted(p, &key);
+            while (_yp_ws(_yp_ch(p, p.i))) {
+                p.i++;
+            }
+        } else {
+            while (!(_yp_ch(p, p.i) == ':' && _yp_blank(_yp_ch(p, p.i + 1))) && !_yp_eol(_yp_ch(p, p.i))) {
+                key.push(p.s[p.i]);
+                p.i++;
+            }
+            _yp_trim_right(&key);
+        }
+        if (!p.failed && _yp_ch(p, p.i) != ':') {
+            _yp_fail(p, p.i, "expected ':' after a mapping key");
+        }
+        if (p.failed) {
+            key.free();
+            break;
+        }
+        p.i++;
+        if (JsonValue_get(map, key.cstr()) != null) {
+            _yp_fail(p, kat, "duplicate key");
+            key.free();
+            break;
+        }
+        while (_yp_ws(_yp_ch(p, p.i))) {
+            p.i++;
+        }
+        const char c = _yp_ch(p, p.i);
+        *JsonValue val = null;
+        if (_yp_eol(c) || c == '#') {
+            _yp_skip(p);
+            if (p.i >= p.n || p.failed || _yp_marker(p, p.i)) {
+                val = JsonValue_null();
+            } else {
+                const int64 c2 = _yp_col(p, p.i);
+                if (c2 > col) {
+                    val = _yp_node(p, col, true);
+                } else if (c2 == col && _yp_ch(p, p.i) == '-' && _yp_blank(_yp_ch(p, p.i + 1))) {
+                    val = _yp_seq(p, col);
+                } else {
+                    val = JsonValue_null();
+                }
+            }
+        } else {
+            val = _yp_node(p, col, false);
+        }
+        if (p.failed) {
+            JsonValue_free(val);
+            key.free();
+            break;
+        }
+        JsonValue_set(map, key.cstr(), val);
+        key.free();
+        _yp_skip(p);
+        if (p.failed || p.i >= p.n || _yp_marker(p, p.i)) {
+            break;
+        }
+        const int64 c3 = _yp_col(p, p.i);
+        if (c3 < col) {
+            break;
+        }
+        if (c3 > col) {
+            _yp_fail(p, p.i, "bad indentation of a mapping entry");
+            break;
+        }
+        if (_yp_ch(p, p.i) == '-' && _yp_blank(_yp_ch(p, p.i + 1))) {
+            _yp_fail(p, p.i, "expected a mapping key, found a sequence entry");
+            break;
+        }
+    }
+    if (p.failed) {
+        JsonValue_free(map);
+        return null;
+    }
+    return map;
+}
+
+// The node at p.i, whose parent is indented `parent`. block_ok is false for a value on
+// its key's line, where a block collection cannot start.
+*JsonValue _yp_node(_Yp* p, int64 parent, bool block_ok) {
+    if (++p.depth > YAML_MAX_DEPTH) {
+        _yp_fail(p, p.i, "nested too deeply");
+        return null;
+    }
+    const int64 col = _yp_col(p, p.i);
+    const char c = _yp_ch(p, p.i);
+    *JsonValue v = null;
+    if (c == '-' && _yp_blank(_yp_ch(p, p.i + 1))) {
+        if (!block_ok) {
+            _yp_fail(p, p.i, "a block sequence cannot start on its key's line");
+        } else {
+            v = _yp_seq(p, col);
+        }
+    } else if (c == '|' || c == '>') {
+        v = _yp_block_scalar(p, parent);
+    } else if (_yp_indicator_error(p)) {
+        v = null;
+    } else if (_yp_is_key(p)) {
+        if (!block_ok) {
+            _yp_fail(p, p.i, "mapping values are not allowed here");
+        } else {
+            v = _yp_map(p, col);
+        }
+    } else if (c == '[' || c == '{') {
+        v = _yp_flow(p);
+        if (!p.failed) {
+            _yp_end_line(p);
+        }
+    } else if (c == '"' || c == '\'') {
+        let t: String;
+        t.init(16);
+        _yp_quoted(p, &t);
+        if (!p.failed) {
+            _yp_end_line(p);
+            v = _yp_string(t.data, t.len);
+        }
+        t.free();
+    } else {
+        v = _yp_plain(p, parent);
+    }
+    p.depth--;
+    if (p.failed) {
+        JsonValue_free(v);
+        return null;
+    }
+    return v;
+}
+
+void _yp_set_error(_Yp* p, YamlError* err) {
+    if (err == null) {
+        return;
+    }
+    int line = 1;
+    int64 ls = 0;
+    for (k in 0..p.err_at) {
+        if (p.s[k] == '\n') {
+            line++;
+            ls = k + 1;
+        }
+    }
+    err.line = line;
+    err.col = (int)(p.err_at - ls) + 1;
+    if (err.message.data == null) {
+        err.message.init(64);
+    }
+    err.message.clear();
+    err.message.append(p.err.cstr());
+}
+
+// Parses the YAML document in the len bytes at text. Returns the value (free it with
+// JsonValue_free), or null on an error, which is described in *err (err may be null). An
+// empty document is a JSON null. CRLF line ends and a UTF-8 byte order mark are accepted.
+*JsonValue yaml_parse_bytes(*char text, int64 len, YamlError* err) {
+    let p: _Yp;
+    p.s = alloc<char>(len + 1);
+    p.n = 0;
+    int64 k = 0;
+    if (len >= 3 && (uint8)text[0] == 0xEF && (uint8)text[1] == 0xBB && (uint8)text[2] == 0xBF) {
+        k = 3;
+    }
+    while (k < len) {
+        if (text[k] == '\r' && k + 1 < len && text[k + 1] == '\n') {
+            k++;
+            continue;
+        }
+        p.s[p.n] = text[k];
+        p.n++;
+        k++;
+    }
+    p.s[p.n] = 0;
+    p.err.init(64);
+    *JsonValue root = null;
+    _yp_skip(&p);
+    if (!p.failed && p.i < p.n && p.s[p.i] == '%' && _yp_col(&p, p.i) == 0) {
+        _yp_fail(&p, p.i, "directives are not supported");
+    }
+    bool started = false;
+    if (!p.failed && _yp_marker(&p, p.i) && p.s[p.i] == '-') {
+        p.i += 3;
+        started = true;
+        while (_yp_ws(_yp_ch(&p, p.i))) {
+            p.i++;
+        }
+        if (_yp_ch(&p, p.i) == '#' || _yp_eol(_yp_ch(&p, p.i))) {
+            _yp_skip(&p);
+        }
+    }
+    if (!p.failed) {
+        if (p.i >= p.n || (_yp_marker(&p, p.i) && p.s[p.i] == '.')) {
+            root = JsonValue_null();
+        } else if (_yp_marker(&p, p.i)) {
+            root = JsonValue_null();
+        } else {
+            root = _yp_node(&p, -1, true);
+        }
+    }
+    if (!p.failed) {
+        _yp_skip(&p);
+        if (p.i < p.n && _yp_marker(&p, p.i) && p.s[p.i] == '.') {
+            p.i += 3;
+            _yp_end_line(&p);
+            _yp_skip(&p);
+        }
+        if (!p.failed && p.i < p.n) {
+            if (_yp_marker(&p, p.i) && p.s[p.i] == '-') {
+                _yp_fail(&p, p.i, "several documents in one stream are not supported");
+            } else {
+                _yp_fail(&p, p.i, "unexpected content (check the indentation)");
+            }
+        }
+    }
+    if (p.failed) {
+        JsonValue_free(root);
+        root = null;
+        _yp_set_error(&p, err);
+    } else if (err != null) {
+        err.line = 0;
+        err.col = 0;
+        if (err.message.data != null) {
+            err.message.clear();
+        }
+    }
+    free((*void)p.s);
+    p.err.free();
+    return root;
+}
+
+// Parses a NUL-terminated YAML document; see yaml_parse_bytes.
+*JsonValue yaml_parse(string text, YamlError* err) {
+    return yaml_parse_bytes((*char)text, (int64)strlen(text), err);
+}
+
+// Reads and parses the YAML file at path; see yaml_parse_bytes. A file that cannot be read
+// is an error at line 0.
+*JsonValue yaml_load(string path, YamlError* err) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) {
+        if (err != null) {
+            err.line = 0;
+            err.col = 0;
+            if (err.message.data == null) {
+                err.message.init(64);
+            }
+            err.message.clear();
+            err.message.append("cannot read the file");
+        }
+        return null;
+    }
+    *JsonValue v = yaml_parse_bytes((*char)d, n, err);
+    free((*void)d);
+    return v;
+}

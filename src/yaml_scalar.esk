@@ -1,0 +1,367 @@
+// yaml_scalar.esk: block and flow scalars (part of yaml.esk, which imports it in order after the ones before it)
+
+// A literal (|) or folded (>) block scalar at p.i, whose parent node is indented `parent`.
+*JsonValue _yp_block_scalar(_Yp* p, int64 parent) {
+    const char style = p.s[p.i];
+    p.i++;
+    int chomp = 0;
+    int64 explicit_ind = 0;
+    for (r in 0..2) {
+        const char c = _yp_ch(p, p.i);
+        if ((c == '-' || c == '+') && chomp == 0) {
+            chomp = c == '-' ? -1 : 1;
+            p.i++;
+        } else if (c >= '1' && c <= '9' && explicit_ind == 0) {
+            explicit_ind = (int64)(c - '0');
+            p.i++;
+        }
+    }
+    if (!_yp_blank(_yp_ch(p, p.i))) {
+        _yp_fail(p, p.i, "unexpected text after the block scalar indicator");
+        return null;
+    }
+    _yp_end_line(p);
+    if (p.failed) {
+        return null;
+    }
+    if (p.i < p.n) {
+        p.i++;
+    }
+    const int64 base = parent < 0 ? 0 : parent + 1;
+    int64 ind = 0;
+    if (explicit_ind > 0) {
+        ind = (parent < 0 ? 0 : parent) + explicit_ind;
+    } else {
+        int64 k = p.i;
+        ind = -1;
+        while (k < p.n) {
+            int64 sp = 0;
+            while (_yp_ch(p, k + sp) == ' ') {
+                sp++;
+            }
+            if (_yp_ch(p, k + sp) == '\n') {
+                k = k + sp + 1;
+                continue;
+            }
+            if (k + sp < p.n) {
+                ind = sp;
+            }
+            break;
+        }
+        if (ind < base) {
+            ind = -1;
+        }
+    }
+    let out: String;
+    out.init(64);
+    int pending = 0;
+    bool first = true;
+    bool prev_more = false;
+    while (p.i < p.n && ind >= 0) {
+        int64 sp = 0;
+        while (_yp_ch(p, p.i + sp) == ' ') {
+            sp++;
+        }
+        int64 e = p.i + sp;
+        while (_yp_ws(_yp_ch(p, e))) {
+            e++;
+        }
+        const bool empty = _yp_eol(_yp_ch(p, e));
+        if (!empty && sp < ind) {
+            if (_yp_ch(p, p.i + sp) == '\t' && sp < ind) {
+                _yp_fail(p, p.i + sp, "a tab character indents this line (indent with spaces)");
+            }
+            break;
+        }
+        if (_yp_marker(p, p.i)) {
+            break;
+        }
+        int64 le = p.i;
+        while (!_yp_eol(_yp_ch(p, le))) {
+            le++;
+        }
+        if (empty) {
+            pending++;
+        } else {
+            *char text = p.s + p.i + ind;
+            const int64 len = le - (p.i + ind);
+            const bool more = text[0] == ' ' || text[0] == '\t';
+            if (first) {
+                for (b in 0..pending) {
+                    out.push('\n');
+                }
+            } else if (style == '>' && !more && !prev_more) {
+                if (pending == 0) {
+                    out.push(' ');
+                }
+                for (b in 0..pending) {
+                    out.push('\n');
+                }
+            } else {
+                for (b in 0..pending + 1) {
+                    out.push('\n');
+                }
+            }
+            out.append_bytes(text, len);
+            first = false;
+            prev_more = more;
+            pending = 0;
+        }
+        p.i = le < p.n ? le + 1 : le;
+    }
+    if (!first) {
+        if (chomp == 0) {
+            out.push('\n');
+        } else if (chomp == 1) {
+            for (b in 0..pending + 1) {
+                out.push('\n');
+            }
+        }
+    } else if (chomp == 1) {
+        for (b in 0..pending) {
+            out.push('\n');
+        }
+    }
+    *JsonValue v = _yp_string(out.data, out.len);
+    out.free();
+    return v;
+}
+
+*JsonValue _yp_flow(_Yp* p);
+
+// Spaces, line breaks and comments inside a flow collection.
+void _yp_flow_skip(_Yp* p) {
+    while (p.i < p.n) {
+        const char c = p.s[p.i];
+        if (c == ' ' || c == '\t' || c == '\n') {
+            p.i++;
+        } else if (c == '#' && (p.i == 0 || _yp_blank(p.s[p.i - 1]))) {
+            _yp_skip_comment(p);
+        } else {
+            return;
+        }
+    }
+}
+
+bool _yp_flow_stop(_Yp* p, int64 k) {
+    const char c = _yp_ch(p, k);
+    if (c == ',' || c == '[' || c == ']' || c == '{' || c == '}') {
+        return true;
+    }
+    if (c == ':') {
+        const char d = _yp_ch(p, k + 1);
+        return _yp_blank(d) || d == ',' || d == ']' || d == '}';
+    }
+    if (c == '#' && k > 0 && _yp_blank(p.s[k - 1])) {
+        return true;
+    }
+    return c == 0 && k >= p.n;
+}
+
+// A plain scalar in a flow collection, folded over line breaks.
+void _yp_flow_plain(_Yp* p, String* t) {
+    while (!p.failed) {
+        while (!_yp_flow_stop(p, p.i) && !_yp_eol(_yp_ch(p, p.i))) {
+            t.push(p.s[p.i]);
+            p.i++;
+        }
+        _yp_trim_right(t);
+        if (_yp_ch(p, p.i) != '\n') {
+            return;
+        }
+        int64 k = p.i;
+        int breaks = 0;
+        while (_yp_ch(p, k) == '\n') {
+            k++;
+            while (_yp_ws(_yp_ch(p, k))) {
+                k++;
+            }
+            if (_yp_ch(p, k) == '\n') {
+                breaks++;
+            }
+        }
+        if (_yp_flow_stop(p, k) || (k >= p.n)) {
+            return;
+        }
+        if (breaks == 0) {
+            t.push(' ');
+        }
+        for (b in 0..breaks) {
+            t.push('\n');
+        }
+        p.i = k;
+    }
+}
+
+*JsonValue _yp_flow_scalar(_Yp* p) {
+    let t: String;
+    t.init(16);
+    *JsonValue v = null;
+    const char c = _yp_ch(p, p.i);
+    if (c == '"' || c == '\'') {
+        _yp_quoted(p, &t);
+        v = _yp_string(t.data, t.len);
+    } else {
+        if (_yp_indicator_error(p)) {
+            t.free();
+            return null;
+        }
+        if (_yp_flow_stop(p, p.i)) {
+            _yp_fail(p, p.i, "expected a value");
+            t.free();
+            return null;
+        }
+        _yp_flow_plain(p, &t);
+        v = _yp_resolve(&t);
+    }
+    t.free();
+    return v;
+}
+
+*JsonValue _yp_flow(_Yp* p) {
+    _yp_flow_skip(p);
+    const char c = _yp_ch(p, p.i);
+    if (c != '[' && c != '{') {
+        return _yp_flow_scalar(p);
+    }
+    if (++p.depth > YAML_MAX_DEPTH) {
+        _yp_fail(p, p.i, "nested too deeply");
+        return null;
+    }
+    const int64 open = p.i;
+    p.i++;
+    *JsonValue v = c == '[' ? JsonValue_array() : JsonValue_object();
+    const char close = c == '[' ? ']' : '}';
+    while (!p.failed) {
+        _yp_flow_skip(p);
+        if (_yp_ch(p, p.i) == close) {
+            p.i++;
+            p.depth--;
+            return v;
+        }
+        if (p.i >= p.n) {
+            _yp_fail(p, open, "this flow collection is not closed");
+            break;
+        }
+        if (c == '[') {
+            *JsonValue item = _yp_flow(p);
+            if (p.failed) {
+                JsonValue_free(item);
+                break;
+            }
+            _yp_flow_skip(p);
+            if (_yp_ch(p, p.i) == ':') {
+                JsonValue_free(item);
+                _yp_fail(p, p.i, "a key: value pair inside a flow sequence is not supported");
+                break;
+            }
+            JsonValue_push(v, item);
+        } else {
+            let key: String;
+            key.init(16);
+            const int64 kat = p.i;
+            const char kc = _yp_ch(p, p.i);
+            if (kc == '"' || kc == '\'') {
+                _yp_quoted(p, &key);
+            } else if (kc == '[' || kc == '{') {
+                _yp_fail(p, p.i, "complex keys are not supported");
+            } else if (!_yp_indicator_error(p)) {
+                _yp_flow_plain(p, &key);
+            }
+            if (p.failed) {
+                key.free();
+                break;
+            }
+            _yp_flow_skip(p);
+            *JsonValue val = null;
+            if (_yp_ch(p, p.i) == ':') {
+                p.i++;
+                _yp_flow_skip(p);
+                const char d = _yp_ch(p, p.i);
+                if (d == ',' || d == '}') {
+                    val = JsonValue_null();
+                } else {
+                    val = _yp_flow(p);
+                }
+            } else {
+                val = JsonValue_null();
+            }
+            if (p.failed) {
+                JsonValue_free(val);
+                key.free();
+                break;
+            }
+            if (JsonValue_get(v, key.cstr()) != null) {
+                _yp_fail(p, kat, "duplicate key");
+                JsonValue_free(val);
+                key.free();
+                break;
+            }
+            JsonValue_set(v, key.cstr(), val);
+            key.free();
+        }
+        _yp_flow_skip(p);
+        if (p.i >= p.n) {
+            _yp_fail(p, open, "this flow collection is not closed");
+            break;
+        }
+        const char sep = _yp_ch(p, p.i);
+        if (sep == ',') {
+            p.i++;
+        } else if (sep != close) {
+            _yp_fail(p, p.i, c == '[' ? "expected ',' or ']'" : "expected ',' or '}'");
+        }
+    }
+    JsonValue_free(v);
+    return null;
+}
+
+*JsonValue _yp_node(_Yp* p, int64 parent, bool block_ok);
+
+// A block sequence whose dashes are in column `col`.
+*JsonValue _yp_seq(_Yp* p, int64 col) {
+    *JsonValue arr = JsonValue_array();
+    while (!p.failed) {
+        p.i++;
+        while (_yp_ws(_yp_ch(p, p.i))) {
+            p.i++;
+        }
+        const char c = _yp_ch(p, p.i);
+        *JsonValue item = null;
+        if (_yp_eol(c) || c == '#') {
+            _yp_skip(p);
+            if (p.i < p.n && !p.failed && _yp_col(p, p.i) > col && !_yp_marker(p, p.i)) {
+                item = _yp_node(p, col, true);
+            } else {
+                item = JsonValue_null();
+            }
+        } else {
+            item = _yp_node(p, col, true);
+        }
+        if (p.failed) {
+            JsonValue_free(item);
+            break;
+        }
+        JsonValue_push(arr, item);
+        _yp_skip(p);
+        if (p.failed || p.i >= p.n || _yp_marker(p, p.i)) {
+            break;
+        }
+        const int64 c2 = _yp_col(p, p.i);
+        if (c2 < col) {
+            break;
+        }
+        if (c2 > col) {
+            _yp_fail(p, p.i, "bad indentation of a sequence entry");
+            break;
+        }
+        if (!(_yp_ch(p, p.i) == '-' && _yp_blank(_yp_ch(p, p.i + 1)))) {
+            break;
+        }
+    }
+    if (p.failed) {
+        JsonValue_free(arr);
+        return null;
+    }
+    return arr;
+}
