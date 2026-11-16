@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/eskiu-packages/yaml/actions/workflows/ci.yml"><img src="https://github.com/eskiu-packages/yaml/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-6448d4" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.1.1-6448d4" alt="Version 0.1.1">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
 
@@ -77,7 +77,7 @@ $ eskiuc run examples/config.esk -- examples/service.yaml 'models[1].scales'
 ## Install
 
 ```bash
-eskiuc add yaml --git https://github.com/eskiu-packages/yaml --rev v0.1.0
+eskiuc add yaml --git https://github.com/eskiu-packages/yaml --rev v0.1.1
 ```
 
 It needs Eskiu 0.14 or newer and runs everywhere Eskiu does.
